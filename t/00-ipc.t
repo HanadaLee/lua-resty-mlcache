@@ -601,3 +601,178 @@ qr/\[TRACE\s+\d+ content_by_lua\(nginx\.conf:\d+\):2 loop\]/
 [warn]
 [error]
 [crit]
+
+
+
+=== TEST 19: poll() steps over a run of lost events in a single call
+Events whose index was consumed by broadcast()'s incr() but never stored, either
+because the shm evicted them or because set() returned "no memory", leave a hole
+that can never be filled. Skipping one index per call lets a busy writer outpace
+the reader forever.
+https://github.com/thibaultcha/lua-resty-mlcache/issues/87
+--- http_config
+    init_worker_by_lua_block {
+        local mlcache_ipc = require "resty.mlcache.ipc"
+
+        ipc = assert(mlcache_ipc.new("ipc_shm", true))
+
+        ipc:subscribe("my_channel", function(data)
+            ngx.log(ngx.NOTICE, "my_channel event: ", data)
+        end)
+    }
+--- config
+    location /t {
+        content_by_lua_block {
+            for i = 1, 5 do
+                assert(ipc:broadcast("my_channel", "lost " .. i))
+            end
+
+            assert(ipc:broadcast("my_channel", "survivor"))
+
+            -- events 1 through 5 are gone, 6 is still in the shm
+            for i = 1, 5 do
+                ngx.shared.ipc_shm:delete(i)
+            end
+            ngx.shared.ipc_shm:flush_expired()
+
+            local ok, err = ipc:poll()
+            ngx.say("poll: ", ok, " ", err)
+            ngx.say("ipc.idx: ", ipc.idx)
+
+            assert(ipc:poll())
+            ngx.say("ipc.idx: ", ipc.idx)
+        }
+    }
+--- response_body
+poll: nil timeout
+ipc.idx: 5
+ipc.idx: 6
+--- error_log
+my_channel event: survivor
+--- no_error_log
+[crit]
+[alert]
+
+
+
+=== TEST 20: a long run of holes is scanned in bounded chunks
+--- config
+    location /t {
+        content_by_lua_block {
+            local ipc = assert(require("resty.mlcache.ipc").new("ipc_shm", true))
+            local received = 0
+            ipc:subscribe("channel", function(data)
+                assert(data == "survivor")
+                received = received + 1
+            end)
+            assert(ngx.shared.ipc_shm:set("lua-resty-ipc:index", 2002))
+            assert(ipc:broadcast("channel", "survivor"))
+            local ok, err = ipc:poll(0.001)
+            assert(ok == nil and err == "timeout" and ipc.idx == 1001)
+            ok, err = ipc:poll(0.001)
+            assert(ok == nil and err == "timeout" and ipc.idx == 2002)
+            assert(ipc:poll())
+            assert(ipc.idx == 2003 and received == 1)
+            ngx.say("ok")
+        }
+    }
+--- response_body
+ok
+--- no_error_log
+[error]
+[crit]
+[alert]
+
+
+
+=== TEST 21: polling recovers when no events survive
+--- config
+    location /t {
+        content_by_lua_block {
+            local ipc = assert(require("resty.mlcache.ipc").new("ipc_shm", true))
+            assert(ngx.shared.ipc_shm:set("lua-resty-ipc:index", 5))
+            local ok, err = ipc:poll(0.001)
+            assert(ok == nil and err == "timeout" and ipc.idx == 5)
+            assert(ipc:poll())
+            local received
+            ipc:subscribe("channel", function(data) received = data end)
+            assert(ipc:broadcast("channel", "new event"))
+            assert(ipc:poll())
+            assert(received == "new event" and ipc.idx == 6)
+            ngx.say("ok")
+        }
+    }
+--- response_body
+ok
+--- no_error_log
+[error]
+[crit]
+[alert]
+
+
+
+=== TEST 22: a delayed writer inside the timeout is not skipped
+--- config
+    location /t {
+        content_by_lua_block {
+            local ipc = assert(require("resty.mlcache.ipc").new("ipc_shm", true))
+            local dict = ipc.dict
+            ipc.dict = {
+                get = function(_, key) return dict:get(key) end,
+                incr = function(_, ...) return dict:incr(...) end,
+                set = function(_, key, ...)
+                    if type(key) == "number" then
+                        ngx.sleep(0.01)
+                    end
+                    return dict:set(key, ...)
+                end,
+            }
+            local received
+            ipc:subscribe("channel", function(data) received = data end)
+            local writer = ngx.thread.spawn(function()
+                assert(ipc:broadcast("channel", "delayed"))
+            end)
+            assert(ipc:poll(0.1))
+            assert(ngx.thread.wait(writer))
+            assert(received == "delayed" and ipc.idx == 1)
+            ngx.say("ok")
+        }
+    }
+--- response_body
+ok
+--- no_error_log
+[error]
+[crit]
+[alert]
+
+
+
+=== TEST 23: failed event insertion does not trap later invalidations
+--- config
+    location /t {
+        content_by_lua_block {
+            local ipc = assert(require("resty.mlcache.ipc").new("ipc_shm", true))
+            local dict = ipc.dict
+            ipc.dict = {
+                incr = function(_, ...) return dict:incr(...) end,
+                set = function() return nil, "no memory" end,
+            }
+            local ok, err = ipc:broadcast("channel", "lost")
+            assert(ok == nil and err:find("no memory", 1, true))
+            ipc.dict = dict
+            local received
+            ipc:subscribe("channel", function(data) received = data end)
+            assert(ipc:broadcast("channel", "survivor"))
+            ok, err = ipc:poll(0.001)
+            assert(ok == nil and err == "timeout" and ipc.idx == 1)
+            assert(ipc:poll())
+            assert(received == "survivor" and ipc.idx == 2)
+            ngx.say("ok")
+        }
+    }
+--- response_body
+ok
+--- no_error_log
+[error]
+[crit]
+[alert]
