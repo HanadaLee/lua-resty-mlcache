@@ -99,10 +99,10 @@ end
 
 
 local _M     = {
-    _VERSION = "2.6.0",
+    _VERSION = "2.7.1",
     _AUTHOR  = "Thibault Charbonnier",
     _LICENSE = "MIT",
-    _URL     = "https://github.com/thibaultcha/lua-resty-mlcache",
+    _URL     = "https://github.com/HanadaLee/lua-resty-mlcache",
 }
 local mt = { __index = _M }
 
@@ -319,12 +319,8 @@ function _M.new(name, shm, opts)
 end
 
 
-local function set_lru(self, key, value, ttl, neg_ttl, l1_serializer)
-    if value == nil then
-        ttl = neg_ttl
-        value = CACHE_MISS_SENTINEL_LRU
-
-    elseif l1_serializer then
+local function l1_serialize(value, l1_serializer)
+    if value ~= nil and l1_serializer then
         local ok, err
         ok, value, err = pcall(l1_serializer, value)
         if not ok then
@@ -338,6 +334,21 @@ local function set_lru(self, key, value, ttl, neg_ttl, l1_serializer)
         if value == nil then
             return nil, "l1_serializer returned a nil value"
         end
+    end
+
+    return value
+end
+
+
+local function set_lru(self, key, value, ttl, neg_ttl, l1_serializer)
+    local value, err = l1_serialize(value, l1_serializer)
+    if err then
+        return nil, err
+    end
+
+    if value == nil then
+        ttl = neg_ttl
+        value = CACHE_MISS_SENTINEL_LRU
     end
 
     if ttl == 0 then
@@ -355,7 +366,7 @@ local function set_shm(self, shm_key, value, ttl, neg_ttl, flags, shm_set_tries,
                        throw_no_mem)
     local t = type(value)
     if not TYPES_SUPPORTED[t] then
-        -- string buffer supports many types, but let's keep the original restrictions
+        -- Keep the original type restrictions despite string.buffer's support.
         error("cannot cache value of type " .. t)
     end
 
@@ -484,6 +495,8 @@ local function get_shm_set_lru(self, key, shm_key, l1_serializer)
     end
 
     if went_stale then
+        -- Keep the raw value for resurrection into L2. Serialize only when
+        -- returning it to the caller or promoting it to L1.
         return value, nil, went_stale
     end
 
@@ -498,6 +511,15 @@ local function get_shm_set_lru(self, key, shm_key, l1_serializer)
     else
         ttl = dict:ttl(shm_key)
         if not ttl or ttl <= 0 then
+            value, err = l1_serialize(value, l1_serializer)
+            if err then
+                return nil, err
+            end
+
+            if value == nil then
+                value = CACHE_MISS_SENTINEL_LRU
+            end
+
             return value, nil, nil, is_stale
         end
     end
@@ -517,6 +539,7 @@ local function check_opts(self, opts)
     local resurrect_ttl
     local l1_serializer
     local shm_set_tries
+    local resty_lock_opts
 
     if opts ~= nil then
         if type(opts) ~= "table" then
@@ -571,6 +594,11 @@ local function check_opts(self, opts)
                 error("opts.shm_set_tries must be >= 1", 3)
             end
         end
+
+        resty_lock_opts = opts.resty_lock_opts
+        if resty_lock_opts ~= nil and type(resty_lock_opts) ~= "table" then
+            error("opts.resty_lock_opts must be a table", 3)
+        end
     end
 
     if not ttl then
@@ -593,7 +621,10 @@ local function check_opts(self, opts)
         shm_set_tries = self.shm_set_tries
     end
 
-    return ttl, neg_ttl, resurrect_ttl, l1_serializer, shm_set_tries
+    resty_lock_opts = resty_lock_opts or self.resty_lock_opts
+
+    return ttl, neg_ttl, resurrect_ttl, l1_serializer, shm_set_tries,
+           resty_lock_opts
 end
 
 
@@ -608,8 +639,9 @@ end
 
 
 local function run_callback(self, key, shm_key, data, ttl, neg_ttl,
-    went_stale, l1_serializer, resurrect_ttl, shm_set_tries, cb, ...)
-    local lock, err = resty_lock:new(self.shm_locks, self.resty_lock_opts)
+    went_stale, l1_serializer, resurrect_ttl, shm_set_tries, rlock_opts,
+    cb, ...)
+    local lock, err = resty_lock:new(self.shm_locks, rlock_opts)
     if not lock then
         return nil, "could not create lock: " .. err
     end
@@ -627,8 +659,7 @@ local function run_callback(self, key, shm_key, data, ttl, neg_ttl,
 
         local data2, err, went_stale2, stale2 = get_shm_set_lru(self, key,
                                                                 shm_key,
-                                                                l1_serializer,
-                                                                ttl, neg_ttl)
+                                                                l1_serializer)
         if err then
             return unlock_and_ret(lock, nil, err)
         end
@@ -665,7 +696,12 @@ local function run_callback(self, key, shm_key, data, ttl, neg_ttl,
         -- went_stale is true, hence the value cannot be set in the LRU
         -- cache, and cannot be CACHE_MISS_SENTINEL_LRU
 
-        return data, nil, 4
+        local value, err = l1_serialize(data, l1_serializer)
+        if err then
+            return nil, err
+        end
+
+        return value, nil, 4
     end
 
     -- still not in shm, we are the 1st worker to hold the lock, and thus
@@ -778,8 +814,8 @@ function _M:get(key, opts, cb, ...)
 
     -- opts validation
 
-    local ttl, neg_ttl, resurrect_ttl, l1_serializer, shm_set_tries =
-        check_opts(self, opts)
+    local ttl, neg_ttl, resurrect_ttl, l1_serializer, shm_set_tries,
+          rlock_opts = check_opts(self, opts)
 
     local err, went_stale, is_stale
     data, err, went_stale, is_stale = get_shm_set_lru(self, key, namespaced_key,
@@ -807,7 +843,7 @@ function _M:get(key, opts, cb, ...)
 
     return run_callback(self, key, namespaced_key, data, ttl, neg_ttl,
                         went_stale, l1_serializer, resurrect_ttl,
-                        shm_set_tries, cb, ...)
+                        shm_set_tries, rlock_opts, cb, ...)
 end
 
 
@@ -821,7 +857,8 @@ function _M:renew(key, opts, cb, ...)
     end
 
     -- opts validation
-    local ttl, neg_ttl, _, l1_serializer, shm_set_tries = check_opts(self, opts)
+    local ttl, neg_ttl, _, l1_serializer, shm_set_tries, rlock_opts =
+        check_opts(self, opts)
 
     if type(cb) ~= "function" then
         error("callback must be a function", 2)
@@ -845,16 +882,17 @@ function _M:renew(key, opts, cb, ...)
         if self.dict_miss then
             v, shmerr = self.dict_miss:get_stale(namespaced_key)
             if v == nil and shmerr then
-                -- shmerr can be 'flags' upon successful get_stale() calls, so we
+                -- shmerr can be 'flags' on success, so we
                 -- also check v == nil
-                return nil, "could not read from lua_shared_dict (miss): " .. shmerr
+                return nil, "could not read from lua_shared_dict (miss): "
+                            .. shmerr
             end
         end
     end
 
     local version_before = get_version(shmerr or 0)
 
-    local lock, lock_err = resty_lock:new(self.shm_locks, self.resty_lock_opts)
+    local lock, lock_err = resty_lock:new(self.shm_locks, rlock_opts)
     if not lock then
         return nil, "could not create lock: " .. lock_err
     end
@@ -891,11 +929,12 @@ function _M:renew(key, opts, cb, ...)
                 is_miss = true
 
             elseif shmerr then
-                -- shmerr can be 'flags' upon successful get_stale() calls, so we
+                -- shmerr can be 'flags' on success, so we
                 -- also check v == nil
                 if not lock_err then
                     return unlock_and_ret(lock, nil,
-                        "could not read from lua_shared_dict (miss): " .. shmerr)
+                        "could not read from lua_shared_dict (miss): "
+                        .. shmerr)
                 end
                 return nil, "could not acquire callback lock: " .. lock_err
             end
@@ -932,7 +971,8 @@ function _M:renew(key, opts, cb, ...)
 
     local ok, data, err, new_ttl = xpcall(cb, traceback, ...)
     if not ok then
-        return unlock_and_ret(lock, nil, "callback threw an error: " .. tostring(data))
+        return unlock_and_ret(lock, nil,
+                              "callback threw an error: " .. tostring(data))
     end
 
     if err then
@@ -964,8 +1004,8 @@ function _M:renew(key, opts, cb, ...)
 
     local flags = set_version(0, version)
 
-    data, err = set_shm_set_lru(self, key, namespaced_key, data, ttl, neg_ttl, flags,
-                                shm_set_tries, l1_serializer)
+    data, err = set_shm_set_lru(self, key, namespaced_key, data, ttl, neg_ttl,
+                              flags, shm_set_tries, l1_serializer)
     if err then
         return unlock_and_ret(lock, nil, err)
     end
@@ -975,7 +1015,8 @@ function _M:renew(key, opts, cb, ...)
         if is_hit then
             ok, err = self.dict:delete(namespaced_key)
             if not ok then
-                return unlock_and_ret(lock, nil, "could not delete from shm: " .. err)
+                return unlock_and_ret(lock, nil,
+                                      "could not delete from shm: " .. err)
             end
         end
 
@@ -983,7 +1024,8 @@ function _M:renew(key, opts, cb, ...)
     elseif is_miss then
         ok, err = self.dict_miss:delete(namespaced_key)
         if not ok then
-            return unlock_and_ret(lock, nil, "could not delete from shm (miss): " .. err)
+            return unlock_and_ret(lock, nil,
+                                  "could not delete from shm (miss): " .. err)
         end
     end
 
@@ -1011,6 +1053,7 @@ local function run_thread(self, ops, from, to)
                                                       ctx.l1_serializer,
                                                       ctx.resurrect_ttl,
                                                       ctx.shm_set_tries,
+                                                      ctx.rlock_opts,
                                                       ctx.cb, ctx.arg)
     end
 end
@@ -1131,11 +1174,11 @@ function _M:get_bulk(bulk, opts)
             res[res_idx + 2] = 1
 
         else
-            local pok, ttl, neg_ttl, resurrect_ttl, l1_serializer, shm_set_tries
-                = pcall(check_opts, self, b_opts)
+            local pok, ttl, neg_ttl, resurrect_ttl, l1_serializer,
+                  shm_set_tries, rlock_opts = pcall(check_opts, self, b_opts)
             if not pok then
                 -- strip the stacktrace
-                local err = ttl:match("init%.lua:%d+:%s(.*)")
+                local err = ttl:match("mlcache%.lua:%d+:%s(.*)") or ttl
                 error("options at index " .. i + 1 .. " for operation " ..
                       ceil(i / 4) .. " are invalid: " .. err, 2)
             end
@@ -1172,7 +1215,7 @@ function _M:get_bulk(bulk, opts)
                     cb_ctxs = tablepool.fetch("bulk_cb_ctxs", 1, 0)
                 end
 
-                local ctx = tablepool.fetch("bulk_cb_ctx", 0, 15)
+                local ctx = tablepool.fetch("bulk_cb_ctx", 0, 16)
                 ctx.res_idx = res_idx
                 ctx.cb = b_cb
                 ctx.arg = bulk[i + 3] -- arg
@@ -1185,6 +1228,7 @@ function _M:get_bulk(bulk, opts)
                 ctx.l1_serializer = l1_serializer
                 ctx.resurrect_ttl = resurrect_ttl
                 ctx.shm_set_tries = shm_set_tries
+                ctx.rlock_opts = rlock_opts
                 ctx.data = data
                 ctx.err = nil
                 ctx.hit_lvl = nil
@@ -1229,7 +1273,8 @@ function _M:get_bulk(bulk, opts)
         end
 
         if self.debug then
-            ngx_log(DEBUG, "spawning ", n_threads, " threads to run ", n_cbs, " callbacks")
+            ngx_log(DEBUG, "spawning ", n_threads, " threads to run ",
+                    n_cbs, " callbacks")
         end
 
         local from = 1
@@ -1246,7 +1291,8 @@ function _M:get_bulk(bulk, opts)
             end
 
             if self.debug then
-                ngx_log(DEBUG, "thread ", i, " running callbacks ", from, " to ", to)
+                ngx_log(DEBUG, "thread ", i, " running callbacks ",
+                        from, " to ", to)
             end
 
             threads_idx = threads_idx + 1
@@ -1264,7 +1310,8 @@ function _M:get_bulk(bulk, opts)
             local to = from + rest - 1
 
             if self.debug then
-                ngx_log(DEBUG, "main thread running callbacks ", from, " to ", to)
+                ngx_log(DEBUG, "main thread running callbacks ",
+                        from, " to ", to)
             end
 
             run_thread(self, cb_ctxs, from, to)
@@ -1352,6 +1399,10 @@ function _M:peek(key, stale)
     local flags = shmerr or 0
     local no_ttl = has_flag(flags, NO_TTL_FLAG)
     local ttl = dict:ttl(namespaced_key)
+    if ttl == 0 and not no_ttl then
+        ttl = went_stale and -0.001 or 0.001
+    end
+
     return ttl, nil, value, went_stale, no_ttl
 end
 
@@ -1489,6 +1540,12 @@ function _M:update(timeout)
 
     local _, err = self.poll(timeout)
     if err then
+        if err == "timeout" then
+            -- An invalidation event may have been lost. Refill L1 from L2
+            -- instead of keeping values whose invalidation was skipped.
+            rebuild_lru(self)
+        end
+
         return nil, "could not poll ipc events: " .. err
     end
 

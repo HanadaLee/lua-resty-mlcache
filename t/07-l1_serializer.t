@@ -312,11 +312,6 @@ qr/\[warn\] .*? could not acquire callback lock: timeout/
 --- config
     location /t {
         content_by_lua_block {
-            local forced_now = ngx.now()
-            ngx.now = function()
-                return forced_now
-            end
-
             local mlcache = require "resty.mlcache"
 
             local cache = assert(mlcache.new("my_mlcache", "cache_shm", {
@@ -336,24 +331,29 @@ qr/\[warn\] .*? could not acquire callback lock: timeout/
             -- drop L1 cache value
             cache.lru:delete("key")
 
-            -- advance 0.2 second in the future, and simulate another :get()
-            -- call; the L2 shm entry will still be alive (as its clock is
-            -- not faked), but mlcache will compute a remaining_ttl of 0;
-            -- In such cases, we should _not_ cache the value indefinitely in
-            -- the L1 LRU cache.
-            forced_now = forced_now + 0.2
+            -- Model the boundary between get_stale() and ttl(): the value
+            -- is still readable, but its remaining TTL has reached zero.
+            local dict = cache.dict
+            cache.dict = {
+                get_stale = function(_, key)
+                    return dict:get_stale(key)
+                end,
+                ttl = function() return 0 end,
+            }
 
             local data, err, hit_lvl = cache:get("key", nil, cb)
             assert(data == "override", err or "invalid data value: " .. data)
 
-            ngx.say("+0.200s hit_lvl: ", hit_lvl)
+            ngx.say("zero ttl hit_lvl: ", hit_lvl)
 
             -- the value is not cached in LRU (too short ttl anyway)
 
             data, err, hit_lvl = cache:get("key", nil, cb)
             assert(data == "override", err or "invalid data value: " .. data)
 
-            ngx.say("+0.200s hit_lvl: ", hit_lvl)
+            ngx.say("zero ttl hit_lvl: ", hit_lvl)
+
+            cache.dict = dict
 
             -- make it expire in shm (real wait)
             ngx.sleep(0.201)
@@ -361,13 +361,13 @@ qr/\[warn\] .*? could not acquire callback lock: timeout/
             data, err, hit_lvl = cache:get("key", nil, cb, 91)
             assert(data == "override", err or "invalid data value: " .. data)
 
-            ngx.say("+0.201s hit_lvl: ", hit_lvl)
+            ngx.say("expired hit_lvl: ", hit_lvl)
         }
     }
 --- response_body
-+0.200s hit_lvl: 2
-+0.200s hit_lvl: 2
-+0.201s hit_lvl: 3
+zero ttl hit_lvl: 2
+zero ttl hit_lvl: 2
+expired hit_lvl: 3
 --- no_error_log
 [error]
 
