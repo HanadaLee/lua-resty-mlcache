@@ -1,6 +1,6 @@
 # lua-resty-mlcache
 
-[![CI](https://github.com/thibaultcha/lua-resty-mlcache/actions/workflows/ci.yml/badge.svg)](https://github.com/thibaultcha/lua-resty-mlcache/actions/workflows/ci.yml)
+[![CI](https://github.com/HanadaLee/lua-resty-mlcache/actions/workflows/ci.yml/badge.svg)](https://github.com/HanadaLee/lua-resty-mlcache/actions/workflows/ci.yml)
 
 Fast and automated layered caching for OpenResty.
 
@@ -74,6 +74,7 @@ This library has been presented at **OpenResty Con 2018**.  See the
 - [Methods](#methods)
     - [new](#new)
     - [get](#get)
+    - [renew](#renew)
     - [get_bulk](#get_bulk)
     - [new_bulk](#new_bulk)
     - [each_bulk_res](#each_bulk_res)
@@ -149,43 +150,28 @@ http {
 
 # Requirements
 
-* OpenResty >= `1.11.2.2`
-    * ngx_lua
-    * lua-resty-lrucache
-    * lua-resty-lock
+This fork requires OpenResty with:
 
-Tests matrix results:
+- LuaJIT `string.buffer.encode()` and `string.buffer.decode()`.
+- `tablepool`, `lua-resty-lock`, and `lua-resty-lrucache` with `flush_all()`.
+- The `ngx.shared.DICT:ttl()` API.
 
-| OpenResty   | Compatibility
-|------------:|:--------------------|
-| <           | not tested
-| `1.11.2.x`  | :heavy_check_mark:
-| `1.13.6.x`  | :heavy_check_mark:
-| `1.15.8.x`  | :heavy_check_mark:
-| `1.17.8.x`  | :heavy_check_mark:
-| `1.19.3.x`  | :heavy_check_mark:
-| `1.19.9.x`  | :heavy_check_mark:
-| `1.21.4.x`  | :heavy_check_mark:
-| `1.25.3.x`  | :heavy_check_mark:
-| >           | not tested
+CI runs the full Test::Nginx suite against the official OpenResty Ubuntu package.
 
 [Back to TOC](#table-of-contents)
 
 # Installation
 
-With [LuaRocks](https://luarocks.org/):
+This fork retains Kong's binary L2 format and `renew()` extension. Upstream
+historical tags identify upstream code and do not contain these extensions.
 
-```
-$ luarocks install lua-resty-mlcache
-```
 
-Or via [opm](https://github.com/openresty/opm):
+Clone the versioned fork:
 
+```sh
+git clone --depth=1 --branch 2.7.1 \
+    https://git.hanada.info/hanada/lua-resty-mlcache.git
 ```
-$ opm get thibaultcha/lua-resty-mlcache
-```
-
-Or manually:
 
 Once you have a local copy of this module's `lib/` directory, add it to your
 `LUA_PATH` (or `lua_package_path` directive for OpenResty):
@@ -578,6 +564,23 @@ user.f()
 
 [Back to TOC](#table-of-contents)
 
+renew
+-----
+**syntax:** `value, err, ttl = cache:renew(key, opts?, callback, ...)`
+
+Refresh a key even when it has not expired, update L2 and L1, and broadcast an
+invalidation to other workers. IPC must be configured. The callback follows
+`get()`'s return convention. A negative callback TTL bypasses storage; unlike
+`get()`, callback errors are returned without resurrecting the previous value.
+
+`opts` accepts `ttl`, `neg_ttl`, `l1_serializer`, `shm_set_tries`, and
+`resty_lock_opts`. The third return value is the effective TTL, rather than a
+cache hit level. Concurrent renewals share the callback lock and can reuse a
+value already refreshed by another worker.
+
+[Back to TOC](#table-of-contents)
+
+
 get_bulk
 --------
 **syntax**: `res, err = cache:get_bulk(bulk, opts?)`
@@ -731,7 +734,7 @@ end
 
 peek
 ----
-**syntax:** `ttl, err, value = cache:peek(key, stale?)`
+**syntax:** `ttl, err, value, stale, no_ttl = cache:peek(key, stale?)`
 
 Peek into the L2 (`lua_shared_dict`) cache.
 
@@ -753,7 +756,9 @@ has an indefinite ttl (`ttl=0`). Otherwise, this return value may be positive
 (`key` still valid), or negative (`key` is stale).
 
 The third returned value will be the cached value as stored in the L2 cache, if
-still available.
+still available. The fourth result indicates whether the entry is stale.
+The fifth result, `no_ttl`, identifies entries written with an indefinite TTL;
+the `NO_TTL_FLAG` constant remains exported for compatible direct L2 writes.
 
 This method is useful when you want to determine if a value is cached. A value
 stored in the L2 cache is considered cached regardless of whether or not it is
@@ -924,11 +929,12 @@ This method allows a worker to update its L1 cache (by purging values
 considered stale due to an other worker calling `set()`, `delete()`, or
 `purge()`) before processing a request.
 
-This method accepts a `timeout` argument whose unit is seconds and which
-defaults to `0.3` (300ms). The update operation will timeout if it isn't done
-when this threshold in reached. This avoids `update()` from staying on the CPU
-too long in case there are too many events to process. In an eventually
-consistent system, additional events can wait for the next call to be processed.
+This method accepts a `timeout` argument in seconds, defaulting to `0.3`
+(300ms), which limits waiting for missing event payloads. On timeout, the
+bundled IPC advances over a bounded run of missing events and returns an error.
+`update()` clears the local L1 cache before returning this error, because a
+lost event may have invalidated one of its entries. Subsequent reads refill L1
+from L2. Events still present after the gap are processed on a later call.
 
 A typical design pattern is to call `update()` **only once** before each
 request processing. This allows your hot code paths to perform a single shm

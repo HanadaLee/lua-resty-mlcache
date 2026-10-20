@@ -1,5 +1,7 @@
 # Table of Contents
 
+- [2.7.1](#271)
+- [2.7.0](#270)
 - [2.6.1](#261)
 - [2.6.0](#260)
 - [2.5.0](#250)
@@ -14,6 +16,44 @@
 - [2.0.0](#200)
 - [1.0.1](#101)
 - [1.0.0](#100)
+
+## [2.7.1]
+
+> Released on: 2026/10/21
+
+- Restore per-call lock options for `get()` and `get_bulk()`, and support them
+  in `renew()`.
+- Apply `l1_serializer` when serving stale values on lock timeout and values
+  with zero remaining TTL, without serializing resurrected L2 values twice.
+- Preserve negative L2 hits at the TTL boundary and reserve a zero `peek()`
+  TTL for entries with indefinite lifetime. Keep the fifth `no_ttl` result.
+- Preserve useful errors for invalid bulk options.
+- Skip missing IPC events in bounded batches and clear local L1 entries when
+  polling times out so lost invalidations cannot leave stale L1 values behind.
+- Retain Kong's `renew()` API, binary L2 format, and `NO_TTL_FLAG`.
+- Update the regression suite and CI for the required LuaJIT buffer APIs.
+
+[Back to TOC](#table-of-contents)
+
+## [2.7.0]
+
+> Released on: 2024/02/09
+
+#### Changed
+
+- Update `peek()` to only return `0` when TTL (or neg-TTL) was "indefinite"
+  (i.e. `0`). Any non-zero TTL now guarantees a non-zero return value for
+  `peek()`. A stale value still in cache may still return a negative return
+  value.
+  [#124](https://github.com/thibaultcha/lua-resty-mlcache/pull/124)
+
+#### Added
+
+- New `get()` option `resty_lock_opts` allows overriding lua-resty-lock option
+  for individual calls.
+  [#125](https://github.com/thibaultcha/lua-resty-mlcache/pull/125)
+
+[Back to TOC](#table-of-contents)
 
 ## [2.6.1]
 
@@ -268,6 +308,7 @@ Initial release.
 
 [Back to TOC](#table-of-contents)
 
+[2.7.0]: https://github.com/thibaultcha/lua-resty-mlcache/compare/2.6.1...2.7.0
 [2.6.1]: https://github.com/thibaultcha/lua-resty-mlcache/compare/2.6.0...2.6.1
 [2.6.0]: https://github.com/thibaultcha/lua-resty-mlcache/compare/2.5.0...2.6.0
 [2.5.0]: https://github.com/thibaultcha/lua-resty-mlcache/compare/2.4.1...2.5.0
@@ -282,3 +323,5 @@ Initial release.
 [2.0.0]: https://github.com/thibaultcha/lua-resty-mlcache/compare/1.0.1...2.0.0
 [1.0.1]: https://github.com/thibaultcha/lua-resty-mlcache/compare/1.0.0...1.0.1
 [1.0.0]: https://github.com/thibaultcha/lua-resty-mlcache/tree/1.0.0
+
+[2.7.1]: https://github.com/HanadaLee/lua-resty-mlcache/releases/tag/2.7.1
